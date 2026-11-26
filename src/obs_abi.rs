@@ -371,7 +371,7 @@ mod dynload {
 
 #[cfg(unix)]
 mod dynload {
-    use std::ffi::{CStr, c_void};
+    use std::ffi::CStr;
 
     pub struct Lib;
 

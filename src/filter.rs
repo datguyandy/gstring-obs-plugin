@@ -605,8 +605,8 @@ unsafe extern "C" fn filter_audio(
 
         let mut planes: [&[f32]; MAX_AV_PLANES] = [&[]; MAX_AV_PLANES];
         let mut plane_count = 0usize;
-        for ch in 0..channels {
-            let ptr = audio_ref.data[ch] as *const f32;
+        for &raw in audio_ref.data.iter().take(channels) {
+            let ptr = raw as *const f32;
             if !ptr.is_null() {
                 planes[plane_count] = unsafe { std::slice::from_raw_parts(ptr, frames) };
                 plane_count += 1;
