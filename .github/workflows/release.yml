@@ -1,0 +1,154 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag / version (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build-windows:
+    name: Build Windows (x64)
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve version
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ("${{ inputs.version }}" -ne "") { "${{ inputs.version }}" } else { "${{ github.ref_name }}" }
+          $ver = $tag.TrimStart("v")
+          echo "tag=$tag" >> $env:GITHUB_OUTPUT
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+      - name: Build release DLL
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+      - name: Copy release artifact for packaging
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force target\release, dist | Out-Null
+          Copy-Item target\x86_64-pc-windows-msvc\release\gstring_captions.dll target\release\gstring_captions.dll
+          New-Item -ItemType Directory -Force staging\gstring-captions\bin\64bit | Out-Null
+          Copy-Item target\release\gstring_captions.dll staging\gstring-captions\bin\64bit\gstring-captions.dll
+          Compress-Archive -Path staging\gstring-captions -DestinationPath dist\gstring-captions-windows-x64.zip -Force
+      - name: Build Windows installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source
+          if (-not $iscc -and (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) {
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc /DPluginVersion="${{ steps.meta.outputs.version }}" packaging\windows\installer.iss
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: |
+            dist/gstring-captions-windows-x64-setup.exe
+            dist/gstring-captions-windows-x64.zip
+
+  build-macos:
+    name: Build macOS (Universal)
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Resolve version
+        id: meta
+        run: |
+          TAG="${{ inputs.version || github.ref_name }}"
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+      - name: Build universal dylib
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist "staging/gstring-captions.plugin/Contents/MacOS"
+          lipo -create \
+            target/aarch64-apple-darwin/release/libgstring_captions.dylib \
+            target/x86_64-apple-darwin/release/libgstring_captions.dylib \
+            -output "staging/gstring-captions.plugin/Contents/MacOS/gstring-captions"
+          sed "s/__VERSION__/${{ steps.meta.outputs.version }}/g" packaging/macos/Info.plist \
+            > "staging/gstring-captions.plugin/Contents/Info.plist"
+          (cd staging && zip -r ../dist/gstring-captions-macos-universal.zip gstring-captions.plugin)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: dist/gstring-captions-macos-universal.zip
+
+  build-linux:
+    name: Build Linux (x64)
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release .so
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+          mkdir -p dist staging/gstring-captions/bin/64bit
+          cp target/x86_64-unknown-linux-gnu/release/libgstring_captions.so \
+             staging/gstring-captions/bin/64bit/gstring-captions.so
+          tar -czf dist/gstring-captions-linux-x64.tar.gz -C staging gstring-captions
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/gstring-captions-linux-x64.tar.gz
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-macos, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version || github.ref_name }}
+          name: GString Captions OBS Plugin ${{ inputs.version || github.ref_name }}
+          generate_release_notes: true
+          files: artifacts/*
