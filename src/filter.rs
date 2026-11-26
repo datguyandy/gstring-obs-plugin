@@ -4,7 +4,7 @@
 //! Capture, etc.), leaves the broadcast audio completely untouched, and
 //! streams gated 16 kHz mono PCM to GString's `/overlay/ws` capture endpoint.
 
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::panic::catch_unwind;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,12 +18,18 @@ use crate::config::{
     COMPILE_TIME_OVERLAY_URL, CaptureMode, FilterSettings, NoiseGatePreset, parse_connection,
 };
 use crate::obs_abi::{
-    LOG_ERROR, LOG_INFO, LOG_WARNING, MAX_AV_PLANES, OBS_SOURCE_AUDIO, ObsApi, api, log,
-    obs_audio_data, obs_combo_format, obs_combo_type, obs_data_t, obs_frontend_event,
+    LOG_ERROR, LOG_INFO, LOG_WARNING, MAX_AV_PLANES, OBS_FRONTEND_EVENT_EXIT,
+    OBS_FRONTEND_EVENT_RECORDING_STARTED, OBS_FRONTEND_EVENT_RECORDING_STARTING,
+    OBS_FRONTEND_EVENT_RECORDING_STOPPED, OBS_FRONTEND_EVENT_RECORDING_STOPPING,
+    OBS_FRONTEND_EVENT_STREAMING_STARTED, OBS_FRONTEND_EVENT_STREAMING_STARTING,
+    OBS_FRONTEND_EVENT_STREAMING_STOPPED, OBS_FRONTEND_EVENT_STREAMING_STOPPING, OBS_SOURCE_AUDIO,
+    ObsApi, api, log, obs_audio_data, obs_combo_format, obs_combo_type, obs_data_t,
     obs_properties_t, obs_property_t, obs_source_info, obs_source_t, obs_source_type,
     obs_text_info_type, obs_text_type, read_c_string,
 };
-use crate::worker::{DesiredState, StatusSink, StatusTone, WorkerStatus, run_worker};
+use crate::worker::{
+    DesiredState, RuntimeSignals, StatusSink, StatusTone, WorkerStatus, run_worker,
+};
 
 const PROP_STATUS: &std::ffi::CStr = c"status_info";
 const PROP_CAPTURE_KEY: &std::ffi::CStr = c"capture_key";
@@ -46,6 +52,7 @@ struct FilterControl {
     source: usize,
     settings: Mutex<FilterSettings>,
     state_tx: watch::Sender<DesiredState>,
+    runtime: Arc<RuntimeSignals>,
     status: Arc<StatusSink>,
     /// Cached bit-exact noise floor read on the audio thread without locking.
     noise_floor_bits: AtomicU32,
@@ -53,10 +60,6 @@ struct FilterControl {
     respect_obs_mute: AtomicBool,
     /// Cached capture mode discriminant (`0` Always, `1` Streaming, `2` StreamOrRec).
     capture_mode: AtomicU32,
-    /// Last mute state pushed to `state_tx` so we only notify on transitions.
-    last_muted: AtomicBool,
-    /// Last active state pushed to `state_tx` so we only notify on transitions.
-    last_active: AtomicBool,
     /// Monotonic counter bumped by "Reconnect now".
     reconnect_nonce: AtomicU64,
 }
@@ -108,26 +111,20 @@ impl FilterControl {
         let recording = FRONTEND_RECORDING.load(Ordering::Relaxed);
         let enabled = self.is_source_enabled();
         let mode_ok = settings.capture_mode.is_active(streaming, recording);
-        let active = enabled && mode_ok;
-        let inactive_reason = if !enabled {
-            "Filter is disabled in OBS.".to_owned()
-        } else {
-            match settings.capture_mode {
-                CaptureMode::StreamingOnly => "Idle — waiting for OBS stream to start.".to_owned(),
-                CaptureMode::StreamingOrRecording => {
-                    "Idle — waiting for OBS stream or recording to start.".to_owned()
-                }
-                CaptureMode::Always => "Idle.".to_owned(),
+        let inactive_reason = match settings.capture_mode {
+            CaptureMode::StreamingOnly => "Idle — waiting for OBS stream to start.".to_owned(),
+            CaptureMode::StreamingOrRecording => {
+                "Idle — waiting for OBS stream or recording to start.".to_owned()
             }
+            CaptureMode::Always => "Idle.".to_owned(),
         };
         let connection = parse_connection(&settings.capture_key, &settings.server_url)
             .map_err(|e| e.message().to_owned());
         let muted = self.is_parent_muted();
-        self.last_muted.store(muted, Ordering::Relaxed);
-        self.last_active.store(active, Ordering::Relaxed);
+        self.runtime.update_from_audio_thread(enabled, muted);
         DesiredState {
             connection,
-            active,
+            active: mode_ok,
             inactive_reason,
             muted,
             reconnect_nonce: self.reconnect_nonce.load(Ordering::Relaxed),
@@ -173,30 +170,26 @@ impl FilterControl {
 /// wake every filter immediately.
 static ACTIVE_FILTERS: Mutex<Vec<Arc<FilterControl>>> = Mutex::new(Vec::new());
 
-unsafe extern "C" fn on_frontend_event(event: obs_frontend_event, _private_data: *mut c_void) {
+unsafe extern "C" fn on_frontend_event(event: c_int, _private_data: *mut c_void) {
     let _ = catch_unwind(|| {
         let relevant = match event {
-            obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STARTING
-            | obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STARTED => {
+            OBS_FRONTEND_EVENT_STREAMING_STARTING | OBS_FRONTEND_EVENT_STREAMING_STARTED => {
                 FRONTEND_STREAMING.store(true, Ordering::Relaxed);
                 true
             }
-            obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPING
-            | obs_frontend_event::OBS_FRONTEND_EVENT_STREAMING_STOPPED => {
+            OBS_FRONTEND_EVENT_STREAMING_STOPPING | OBS_FRONTEND_EVENT_STREAMING_STOPPED => {
                 FRONTEND_STREAMING.store(false, Ordering::Relaxed);
                 true
             }
-            obs_frontend_event::OBS_FRONTEND_EVENT_RECORDING_STARTING
-            | obs_frontend_event::OBS_FRONTEND_EVENT_RECORDING_STARTED => {
+            OBS_FRONTEND_EVENT_RECORDING_STARTING | OBS_FRONTEND_EVENT_RECORDING_STARTED => {
                 FRONTEND_RECORDING.store(true, Ordering::Relaxed);
                 true
             }
-            obs_frontend_event::OBS_FRONTEND_EVENT_RECORDING_STOPPING
-            | obs_frontend_event::OBS_FRONTEND_EVENT_RECORDING_STOPPED => {
+            OBS_FRONTEND_EVENT_RECORDING_STOPPING | OBS_FRONTEND_EVENT_RECORDING_STOPPED => {
                 FRONTEND_RECORDING.store(false, Ordering::Relaxed);
                 true
             }
-            obs_frontend_event::OBS_FRONTEND_EVENT_EXIT => {
+            OBS_FRONTEND_EVENT_EXIT => {
                 FRONTEND_STREAMING.store(false, Ordering::Relaxed);
                 FRONTEND_RECORDING.store(false, Ordering::Relaxed);
                 true
@@ -238,13 +231,19 @@ pub fn unregister_frontend_hooks() {
     }
 }
 
+/// Audio-thread DSP state isolated behind a dedicated `Mutex` (only accessed
+/// via non-blocking `try_lock()` inside `filter_audio`) so every OBS callback
+/// only ever creates a shared `&FilterInstance` — preventing cross-thread
+/// `&mut` / `&` aliasing UB with UI callbacks.
+struct AudioState {
+    resampler: PcmResampler,
+    vad: VadGate,
+}
+
 /// Per-filter instance owned by OBS between `create` and `destroy`.
 struct FilterInstance {
     control: Arc<FilterControl>,
-    /// Owned exclusively by the OBS audio thread (`filter_audio`).
-    resampler: PcmResampler,
-    /// Owned exclusively by the OBS audio thread (`filter_audio`).
-    vad: VadGate,
+    audio: Mutex<AudioState>,
     /// Non-blocking bounded sender to the background WebSocket worker.
     audio_tx: mpsc::Sender<Bytes>,
     /// Background worker OS thread handle (joined on `destroy`).
@@ -471,12 +470,14 @@ unsafe extern "C" fn filter_create(
             reconnect_nonce: 0,
         };
         let (state_tx, state_rx) = watch::channel(placeholder);
+        let runtime = Arc::new(RuntimeSignals::default());
         let (audio_tx, audio_rx) = mpsc::channel(AUDIO_QUEUE_CAPACITY);
 
         let control = Arc::new(FilterControl {
             source: source_addr,
             settings: Mutex::new(initial_settings.clone()),
             state_tx,
+            runtime: Arc::clone(&runtime),
             status: Arc::clone(&status),
             noise_floor_bits: AtomicU32::new(initial_settings.noise_gate.rms_threshold().to_bits()),
             respect_obs_mute: AtomicBool::new(initial_settings.respect_obs_mute),
@@ -485,8 +486,6 @@ unsafe extern "C" fn filter_create(
                 CaptureMode::StreamingOnly => 1,
                 CaptureMode::StreamingOrRecording => 2,
             }),
-            last_muted: AtomicBool::new(false),
-            last_active: AtomicBool::new(false),
             reconnect_nonce: AtomicU64::new(0),
         });
 
@@ -497,6 +496,7 @@ unsafe extern "C" fn filter_create(
         }
 
         let worker_status = Arc::clone(&status);
+        let worker_runtime = Arc::clone(&runtime);
         let worker_thread = thread::Builder::new()
             .name("gstring-captions-ws".to_owned())
             .spawn(move || {
@@ -504,7 +504,12 @@ unsafe extern "C" fn filter_create(
                     .enable_all()
                     .build();
                 match rt {
-                    Ok(rt) => rt.block_on(run_worker(state_rx, audio_rx, worker_status)),
+                    Ok(rt) => rt.block_on(run_worker(
+                        state_rx,
+                        worker_runtime,
+                        audio_rx,
+                        worker_status,
+                    )),
                     Err(err) => {
                         worker_status.set(WorkerStatus::error(format!(
                             "Could not start captions network runtime: {err}"
@@ -516,8 +521,10 @@ unsafe extern "C" fn filter_create(
 
         let instance = Box::new(FilterInstance {
             control,
-            resampler: PcmResampler::default(),
-            vad: VadGate::default(),
+            audio: Mutex::new(AudioState {
+                resampler: PcmResampler::default(),
+                vad: VadGate::default(),
+            }),
             audio_tx,
             worker_thread,
         });
@@ -570,24 +577,28 @@ unsafe extern "C" fn filter_audio(
         let Some(obs) = api() else {
             return;
         };
-        let instance = unsafe { &mut *(data as *mut FilterInstance) };
+        // Shared reference only: UI callbacks concurrently hold `&FilterInstance`.
+        let instance = unsafe { &*(data as *const FilterInstance) };
 
-        // Sync mute & filter-enabled transitions cheaply without blocking.
+        // Lock-free mute & filter-enabled sync (never acquires `settings` mutex
+        // or re-parses URLs on the real-time OBS audio thread).
         let streaming = FRONTEND_STREAMING.load(Ordering::Relaxed);
         let recording = FRONTEND_RECORDING.load(Ordering::Relaxed);
         let enabled = instance.control.is_source_enabled();
         let active = enabled && instance.control.mode().is_active(streaming, recording);
         let muted = instance.control.is_parent_muted();
+        instance
+            .control
+            .runtime
+            .update_from_audio_thread(enabled, muted);
 
-        if active != instance.control.last_active.load(Ordering::Relaxed)
-            || muted != instance.control.last_muted.load(Ordering::Relaxed)
-        {
-            instance.control.refresh_runtime_state();
-        }
+        let Ok(mut dsp) = instance.audio.try_lock() else {
+            return;
+        };
 
         if !active || muted {
-            instance.resampler.reset();
-            instance.vad.reset();
+            dsp.resampler.reset();
+            dsp.vad.reset();
             return;
         }
 
@@ -617,18 +628,16 @@ unsafe extern "C" fn filter_audio(
         }
 
         let floor = f32::from_bits(instance.control.noise_floor_bits.load(Ordering::Relaxed));
-        instance.vad.set_noise_floor(floor);
+        dsp.vad.set_noise_floor(floor);
 
-        let vad = &mut instance.vad;
+        let AudioState { resampler, vad } = &mut *dsp;
         let tx = &instance.audio_tx;
-        instance
-            .resampler
-            .push_planar(&planes[..plane_count], sample_rate, |chunk| {
-                vad.push(chunk, |pcm| {
-                    // Non-blocking: never stall the real-time OBS audio thread.
-                    let _ = tx.try_send(pcm);
-                });
+        resampler.push_planar(&planes[..plane_count], sample_rate, |chunk| {
+            vad.push(chunk, |pcm| {
+                // Non-blocking: never stall the real-time OBS audio thread.
+                let _ = tx.try_send(pcm);
             });
+        });
     });
 
     // Pass-through: never alter the streamer's broadcast audio.

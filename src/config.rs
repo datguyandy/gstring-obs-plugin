@@ -83,6 +83,8 @@ pub enum ConfigError {
     MissingKey,
     MissingServerUrl,
     InvalidServerUrl,
+    InsecureServerUrl,
+    ServerHostMismatch,
     InvalidToken,
 }
 
@@ -97,6 +99,12 @@ impl ConfigError {
                 "Server URL missing — paste a full OBS plugin key or enter the GString overlay server URL."
             }
             Self::InvalidServerUrl => "Server URL is invalid — expected an https:// or wss:// URL.",
+            Self::InsecureServerUrl => {
+                "Server URL must use https:// or wss:// (plain ws:// is only allowed for localhost)."
+            }
+            Self::ServerHostMismatch => {
+                "Server URL override does not match the host embedded in the OBS plugin key. Clear the override or use a matching key."
+            }
             Self::InvalidToken => {
                 "Capture key looks incomplete — copy a fresh OBS plugin key from the dashboard."
             }
@@ -128,9 +136,24 @@ pub fn parse_connection(
         return Err(ConfigError::InvalidToken);
     }
 
+    let override_url = Some(server_url_override.trim()).filter(|s| !s.is_empty());
+    let embedded = embedded_url.filter(|s| !s.is_empty());
+
+    // Refuse redirecting a bundled key's Bearer token to a different remote
+    // host (guards against tampered scene-collection exports overriding the URL).
+    if let (Some(over), Some(emb)) = (override_url, embedded) {
+        let over_norm =
+            Url::parse(&normalize_ws_url(over)?).map_err(|_| ConfigError::InvalidServerUrl)?;
+        let emb_norm =
+            Url::parse(&normalize_ws_url(emb)?).map_err(|_| ConfigError::InvalidServerUrl)?;
+        if over_norm.host_str() != emb_norm.host_str() {
+            return Err(ConfigError::ServerHostMismatch);
+        }
+    }
+
     let base_url = [
-        Some(server_url_override.trim()).filter(|s| !s.is_empty()),
-        embedded_url.filter(|s| !s.is_empty()),
+        override_url,
+        embedded,
         COMPILE_TIME_OVERLAY_URL
             .map(str::trim)
             .filter(|s| !s.is_empty()),
@@ -147,28 +170,43 @@ pub fn parse_connection(
     })
 }
 
+fn is_loopback_host(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 /// Normalize a user-provided overlay base URL or full WS URL into
-/// `ws(s)://<host>/overlay/ws`.
+/// `wss://<host>/overlay/ws` (or `ws://` for loopback only).
 pub fn normalize_ws_url(input: &str) -> Result<String, ConfigError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(ConfigError::MissingServerUrl);
     }
     let mut url = Url::parse(trimmed).map_err(|_| ConfigError::InvalidServerUrl)?;
-    match url.scheme() {
+    let plaintext = match url.scheme() {
         "https" => {
             url.set_scheme("wss")
                 .map_err(|()| ConfigError::InvalidServerUrl)?;
+            false
         }
+        "wss" => false,
         "http" => {
             url.set_scheme("ws")
                 .map_err(|()| ConfigError::InvalidServerUrl)?;
+            true
         }
-        "wss" | "ws" => {}
+        "ws" => true,
         _ => return Err(ConfigError::InvalidServerUrl),
-    }
+    };
     if url.host_str().is_none() {
         return Err(ConfigError::InvalidServerUrl);
+    }
+    if plaintext && !is_loopback_host(&url) {
+        return Err(ConfigError::InsecureServerUrl);
     }
     url.set_query(None);
     url.set_fragment(None);
@@ -205,9 +243,24 @@ impl Default for FilterSettings {
     }
 }
 
+const MAX_SERVER_MESSAGE_CHARS: usize = 200;
+
+/// Sanitize and truncate an untrusted server-supplied string before showing it
+/// in OBS Filter Properties or writing it to the OBS log.
+#[must_use]
+pub fn sanitize_server_message(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_SERVER_MESSAGE_CHARS)
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Human-readable description for fatal server verdicts.
 #[must_use]
 pub fn fatal_verdict_message(code: &str, fallback: &str) -> String {
+    let safe_fallback = sanitize_server_message(fallback);
     match code {
         "superseded" => {
             "Replaced by another capture source (close the web capture tab or extra filter, then click Reconnect)."
@@ -222,7 +275,7 @@ pub fn fatal_verdict_message(code: &str, fallback: &str) -> String {
             "Captions are turned off in the dashboard. Turn them on, then click Reconnect."
                 .to_owned()
         }
-        _ if !fallback.is_empty() => format!("Server stopped capture: {fallback}"),
+        _ if !safe_fallback.is_empty() => format!("Server stopped capture: {safe_fallback}"),
         _ => "The captions server stopped the session. Click Reconnect to try again.".to_owned(),
     }
 }
@@ -240,14 +293,40 @@ mod tests {
     }
 
     #[test]
-    fn server_url_override_wins_over_embedded_url() {
+    fn server_url_override_rejects_different_host_for_bundled_key() {
+        assert_eq!(
+            parse_connection(
+                "gstring:https://overlay.gstringbot.com#v1.abc.def",
+                "https://evil.example.test",
+            ),
+            Err(ConfigError::ServerHostMismatch)
+        );
+        // Same host with explicit port/path is permitted.
         let conn = parse_connection(
             "gstring:https://overlay.gstringbot.com#v1.abc.def",
-            "http://127.0.0.1:8080/",
+            "wss://overlay.gstringbot.com:443/overlay/ws",
         )
-        .expect("override parses");
-        assert_eq!(conn.ws_url, "ws://127.0.0.1:8080/overlay/ws");
-        assert_eq!(conn.token, "v1.abc.def");
+        .expect("matching host override parses");
+        assert_eq!(conn.ws_url, "wss://overlay.gstringbot.com/overlay/ws");
+    }
+
+    #[test]
+    fn rejects_plaintext_ws_for_non_loopback_hosts() {
+        assert_eq!(
+            parse_connection("v1.payload.sig", "http://overlay.gstringbot.com"),
+            Err(ConfigError::InsecureServerUrl)
+        );
+        assert_eq!(
+            parse_connection("gstring:ws://overlay.gstringbot.com#v1.abc.def", ""),
+            Err(ConfigError::InsecureServerUrl)
+        );
+        // Loopback remains allowed for local development.
+        let local = parse_connection("v1.payload.sig", "http://127.0.0.1:8080/")
+            .expect("loopback http allowed");
+        assert_eq!(local.ws_url, "ws://127.0.0.1:8080/overlay/ws");
+        let localhost = parse_connection("v1.payload.sig", "ws://localhost:8080")
+            .expect("localhost ws allowed");
+        assert_eq!(localhost.ws_url, "ws://localhost:8080/overlay/ws");
     }
 
     #[test]
@@ -272,6 +351,15 @@ mod tests {
             parse_connection("gstring:https://example.test", ""),
             Err(ConfigError::InvalidToken)
         );
+    }
+
+    #[test]
+    fn sanitizes_and_truncates_server_messages() {
+        let long = format!("line1\n\r\t{}", "a".repeat(300));
+        let clean = sanitize_server_message(&long);
+        assert!(!clean.contains('\n'));
+        assert!(!clean.contains('\r'));
+        assert!(clean.len() <= MAX_SERVER_MESSAGE_CHARS);
     }
 
     #[test]

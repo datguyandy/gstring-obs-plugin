@@ -8,15 +8,17 @@
 //! - syncs mute state immediately so OBS mute closes the Soniox stream;
 //! - handles pings, reconnect backoff with jitter, and fatal server verdicts.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{self, Message};
 
 use crate::audio::TARGET_SAMPLE_RATE;
@@ -26,6 +28,52 @@ const BASE_BACKOFF_MS: u64 = 500;
 const MAX_BACKOFF_MS: u64 = 15_000;
 const PING_INTERVAL: Duration = Duration::from_secs(20);
 const PING_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded shutdown close timeout so a stalled TCP connection can never freeze
+/// OBS when removing the filter or closing OBS.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Match the server's 64 KiB frame/message cap so a hostile or misconfigured
+/// server cannot push multi-megabyte frames into the OBS process.
+const MAX_WS_MESSAGE_BYTES: usize = 64 * 1024;
+
+/// Lock-free runtime flags updated directly by OBS's real-time audio thread
+/// (`filter_audio`) without taking any mutex, cloning settings, or parsing URLs.
+pub struct RuntimeSignals {
+    pub enabled: AtomicBool,
+    pub muted: AtomicBool,
+    pub changed: Notify,
+}
+
+impl Default for RuntimeSignals {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(true),
+            muted: AtomicBool::new(false),
+            changed: Notify::new(),
+        }
+    }
+}
+
+impl RuntimeSignals {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    #[must_use]
+    pub fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Update enabled/muted from the real-time audio thread and wake the worker
+    /// only when a flag actually changed.
+    pub fn update_from_audio_thread(&self, enabled: bool, muted: bool) {
+        let prev_enabled = self.enabled.swap(enabled, Ordering::Relaxed);
+        let prev_muted = self.muted.swap(muted, Ordering::Relaxed);
+        if prev_enabled != enabled || prev_muted != muted {
+            self.changed.notify_one();
+        }
+    }
+}
 
 /// Severity shown in OBS's read-only status info widget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,6 +215,7 @@ impl StatusSink {
 /// Run the background capture worker loop until `state_rx` is closed.
 pub async fn run_worker(
     mut state_rx: watch::Receiver<DesiredState>,
+    runtime: Arc<RuntimeSignals>,
     mut audio_rx: mpsc::Receiver<Bytes>,
     status: Arc<StatusSink>,
 ) {
@@ -178,6 +227,8 @@ pub async fn run_worker(
 
     loop {
         let desired = state_rx.borrow_and_update().clone();
+        let enabled_now = runtime.is_enabled();
+        let active_now = desired.active && enabled_now;
 
         let conn = match desired.connection {
             Ok(conn) => conn,
@@ -187,20 +238,35 @@ pub async fn run_worker(
                 fatal_latch = None;
                 drain_audio(&mut audio_rx);
                 status.set(WorkerStatus::warning(msg));
-                if state_rx.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    res = state_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    _ = runtime.changed.notified() => {}
                 }
                 continue;
             }
         };
 
-        if !desired.active {
+        if !active_now {
             session_id = None;
             attempt = 0;
             drain_audio(&mut audio_rx);
-            status.set(WorkerStatus::normal(desired.inactive_reason));
-            if state_rx.changed().await.is_err() {
-                break;
+            let reason = if !enabled_now {
+                "Filter is disabled in OBS.".to_owned()
+            } else {
+                desired.inactive_reason
+            };
+            status.set(WorkerStatus::normal(reason));
+            tokio::select! {
+                res = state_rx.changed() => {
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                _ = runtime.changed.notified() => {}
             }
             continue;
         }
@@ -208,8 +274,13 @@ pub async fn run_worker(
         if let Some((latched_conn, latched_nonce)) = &fatal_latch {
             if *latched_conn == conn && *latched_nonce == desired.reconnect_nonce {
                 drain_audio(&mut audio_rx);
-                if state_rx.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    res = state_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    _ = runtime.changed.notified() => {}
                 }
                 continue;
             }
@@ -229,6 +300,7 @@ pub async fn run_worker(
             desired.reconnect_nonce,
             &mut session_id,
             &mut state_rx,
+            &runtime,
             &mut audio_rx,
             &status,
         )
@@ -236,10 +308,17 @@ pub async fn run_worker(
         {
             SessionOutcome::ControlChanged => {
                 attempt = 0;
-                if !state_rx.has_changed().unwrap_or(false) && state_rx.borrow().active {
-                    // Nothing left to wait on if channel closed.
-                    if state_rx.changed().await.is_err() {
-                        break;
+                if !state_rx.has_changed().unwrap_or(false)
+                    && state_rx.borrow().active
+                    && runtime.is_enabled()
+                {
+                    tokio::select! {
+                        res = state_rx.changed() => {
+                            if res.is_err() {
+                                break;
+                            }
+                        }
+                        _ = runtime.changed.notified() => {}
                     }
                 }
             }
@@ -248,8 +327,13 @@ pub async fn run_worker(
                 attempt = 0;
                 fatal_latch = Some((conn, desired.reconnect_nonce));
                 status.set(st);
-                if state_rx.changed().await.is_err() {
-                    break;
+                tokio::select! {
+                    res = state_rx.changed() => {
+                        if res.is_err() {
+                            break;
+                        }
+                    }
+                    _ = runtime.changed.notified() => {}
                 }
             }
             SessionOutcome::Retry { status: st } => {
@@ -264,6 +348,9 @@ pub async fn run_worker(
                         }
                         attempt = 0;
                     }
+                    _ = runtime.changed.notified() => {
+                        attempt = 0;
+                    }
                 }
             }
         }
@@ -275,6 +362,7 @@ async fn run_single_connection(
     reconnect_nonce: u64,
     session_id: &mut Option<String>,
     state_rx: &mut watch::Receiver<DesiredState>,
+    runtime: &Arc<RuntimeSignals>,
     audio_rx: &mut mpsc::Receiver<Bytes>,
     status: &Arc<StatusSink>,
 ) -> SessionOutcome {
@@ -302,7 +390,10 @@ async fn run_single_connection(
         HeaderValue::from_static("gstring-overlay"),
     );
 
-    let connect_fut = tokio_tungstenite::connect_async(request);
+    let ws_config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_MESSAGE_BYTES));
+    let connect_fut = tokio_tungstenite::connect_async_with_config(request, Some(ws_config), false);
     let connect_result = tokio::select! {
         res = tokio::time::timeout(Duration::from_secs(12), connect_fut) => res,
         changed = state_rx.changed() => {
@@ -310,7 +401,15 @@ async fn run_single_connection(
                 return SessionOutcome::ControlChanged;
             }
             let next = state_rx.borrow().clone();
-            if !next.active || next.connection.as_ref().ok() != Some(conn) || next.reconnect_nonce != reconnect_nonce {
+            if !next.active || !runtime.is_enabled() || next.connection.as_ref().ok() != Some(conn) || next.reconnect_nonce != reconnect_nonce {
+                return SessionOutcome::ControlChanged;
+            }
+            return SessionOutcome::Retry {
+                status: WorkerStatus::normal("Connecting to captions server…"),
+            };
+        }
+        _ = runtime.changed.notified() => {
+            if !runtime.is_enabled() {
                 return SessionOutcome::ControlChanged;
             }
             return SessionOutcome::Retry {
@@ -360,7 +459,7 @@ async fn run_single_connection(
         };
     }
 
-    let mut current_muted = state_rx.borrow().muted;
+    let mut current_muted = state_rx.borrow().muted || runtime.is_muted();
     if current_muted {
         let _ = send_json(&mut sink, &CaptureIn::Mute { muted: true }).await;
     }
@@ -378,21 +477,43 @@ async fn run_single_connection(
         tokio::select! {
             changed = state_rx.changed() => {
                 if changed.is_err() {
-                    let _ = send_json(&mut sink, &CaptureIn::Stop).await;
-                    let _ = sink.close().await;
+                    close_gracefully(&mut sink).await;
                     return SessionOutcome::ControlChanged;
                 }
                 let next = state_rx.borrow().clone();
                 if !next.active
+                    || !runtime.is_enabled()
                     || next.connection.as_ref().ok() != Some(conn)
                     || next.reconnect_nonce != reconnect_nonce
                 {
-                    let _ = send_json(&mut sink, &CaptureIn::Stop).await;
-                    let _ = sink.close().await;
+                    close_gracefully(&mut sink).await;
                     return SessionOutcome::ControlChanged;
                 }
-                if next.muted != current_muted {
-                    current_muted = next.muted;
+                let next_muted = next.muted || runtime.is_muted();
+                if next_muted != current_muted {
+                    current_muted = next_muted;
+                    if current_muted {
+                        drain_audio(audio_rx);
+                        status.set(WorkerStatus::warning("Muted in OBS — not sending audio"));
+                    } else {
+                        status.set(WorkerStatus::normal("Connected — listening"));
+                    }
+                    if send_json(&mut sink, &CaptureIn::Mute { muted: current_muted }).await.is_err() {
+                        return SessionOutcome::Retry {
+                            status: WorkerStatus::warning("Connection lost. Reconnecting…"),
+                        };
+                    }
+                }
+            }
+
+            _ = runtime.changed.notified() => {
+                if !runtime.is_enabled() {
+                    close_gracefully(&mut sink).await;
+                    return SessionOutcome::ControlChanged;
+                }
+                let next_muted = state_rx.borrow().muted || runtime.is_muted();
+                if next_muted != current_muted {
+                    current_muted = next_muted;
                     if current_muted {
                         drain_audio(audio_rx);
                         status.set(WorkerStatus::warning("Muted in OBS — not sending audio"));
@@ -409,8 +530,7 @@ async fn run_single_connection(
 
             maybe_frame = audio_rx.recv() => {
                 let Some(frame) = maybe_frame else {
-                    let _ = send_json(&mut sink, &CaptureIn::Stop).await;
-                    let _ = sink.close().await;
+                    close_gracefully(&mut sink).await;
                     return SessionOutcome::ControlChanged;
                 };
                 if current_muted {
@@ -504,6 +624,17 @@ fn status_from_server(status: &str) -> WorkerStatus {
         "error" => WorkerStatus::error("Speech service unavailable — retrying…"),
         _ => WorkerStatus::normal("Connected"),
     }
+}
+
+async fn close_gracefully<S, E>(sink: &mut S)
+where
+    S: futures_util::Sink<Message, Error = E> + Unpin,
+{
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+        let _ = send_json(sink, &CaptureIn::Stop).await;
+        let _ = sink.close().await;
+    })
+    .await;
 }
 
 async fn send_json<S, E>(sink: &mut S, value: &impl Serialize) -> Result<(), ()>
@@ -633,13 +764,19 @@ mod tests {
             reconnect_nonce: 0,
         };
         let (state_tx, state_rx) = watch::channel(initial.clone());
+        let runtime = Arc::new(RuntimeSignals::default());
         let (audio_tx, audio_rx) = mpsc::channel(8);
         let status = Arc::new(StatusSink::new(
             WorkerStatus::normal("init"),
             Arc::new(|_| {}),
         ));
 
-        let worker_task = tokio::spawn(run_worker(state_rx, audio_rx, Arc::clone(&status)));
+        let worker_task = tokio::spawn(run_worker(
+            state_rx,
+            Arc::clone(&runtime),
+            audio_rx,
+            Arc::clone(&status),
+        ));
 
         // Wait briefly for status to reach listening.
         for _ in 0..50 {

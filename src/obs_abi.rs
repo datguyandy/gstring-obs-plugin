@@ -71,28 +71,21 @@ pub enum obs_combo_format {
     OBS_COMBO_FORMAT_BOOL = 4,
 }
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum obs_frontend_event {
-    OBS_FRONTEND_EVENT_STREAMING_STARTING = 0,
-    OBS_FRONTEND_EVENT_STREAMING_STARTED = 1,
-    OBS_FRONTEND_EVENT_STREAMING_STOPPING = 2,
-    OBS_FRONTEND_EVENT_STREAMING_STOPPED = 3,
-    OBS_FRONTEND_EVENT_RECORDING_STARTING = 4,
-    OBS_FRONTEND_EVENT_RECORDING_STARTED = 5,
-    OBS_FRONTEND_EVENT_RECORDING_STOPPING = 6,
-    OBS_FRONTEND_EVENT_RECORDING_STOPPED = 7,
-    OBS_FRONTEND_EVENT_SCENE_CHANGED = 8,
-    OBS_FRONTEND_EVENT_SCENE_LIST_CHANGED = 9,
-    OBS_FRONTEND_EVENT_TRANSITION_CHANGED = 10,
-    OBS_FRONTEND_EVENT_TRANSITION_STOPPED = 11,
-    OBS_FRONTEND_EVENT_TRANSITION_LIST_CHANGED = 12,
-    OBS_FRONTEND_EVENT_SCENE_COLLECTION_CHANGED = 13,
-    OBS_FRONTEND_EVENT_SCENE_COLLECTION_LIST_CHANGED = 14,
-    OBS_FRONTEND_EVENT_PROFILE_CHANGED = 15,
-    OBS_FRONTEND_EVENT_PROFILE_LIST_CHANGED = 16,
-    OBS_FRONTEND_EVENT_EXIT = 17,
-}
+/// OBS frontend event discriminants from `obs-frontend-api.h`.
+///
+/// Passed across the C ABI as raw `c_int` (never a Rust `enum`) because OBS
+/// 30+ routinely emits newer event values above `EXIT` (replay buffer, studio
+/// mode, finished loading, etc.), which would be undefined behaviour in a
+/// partial Rust `#[repr(C)] enum`.
+pub const OBS_FRONTEND_EVENT_STREAMING_STARTING: c_int = 0;
+pub const OBS_FRONTEND_EVENT_STREAMING_STARTED: c_int = 1;
+pub const OBS_FRONTEND_EVENT_STREAMING_STOPPING: c_int = 2;
+pub const OBS_FRONTEND_EVENT_STREAMING_STOPPED: c_int = 3;
+pub const OBS_FRONTEND_EVENT_RECORDING_STARTING: c_int = 4;
+pub const OBS_FRONTEND_EVENT_RECORDING_STARTED: c_int = 5;
+pub const OBS_FRONTEND_EVENT_RECORDING_STOPPING: c_int = 6;
+pub const OBS_FRONTEND_EVENT_RECORDING_STOPPED: c_int = 7;
+pub const OBS_FRONTEND_EVENT_EXIT: c_int = 17;
 
 #[repr(C)]
 pub struct obs_module_t {
@@ -140,7 +133,7 @@ pub type obs_property_clicked_t = Option<
 >;
 
 pub type obs_frontend_event_cb =
-    Option<unsafe extern "C" fn(event: obs_frontend_event, private_data: *mut c_void)>;
+    Option<unsafe extern "C" fn(event: c_int, private_data: *mut c_void)>;
 
 /// Exact layout of `struct obs_source_info` from OBS Studio 31.0.0.
 ///
